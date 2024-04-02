@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-func randstring(n int) string {
+func randString(n int) string {
 	b := make([]byte, 2*n)
 	crand.Read(b)
 	s := base64.URLEncoding.EncodeToString(b)
@@ -280,7 +280,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// so that old crashed instance's ClientEnds can't send.
 	cfg.endnames[i] = make([]string, cfg.n)
 	for j := 0; j < cfg.n; j++ {
-		cfg.endnames[i][j] = randstring(20)
+		cfg.endnames[i][j] = randString(20)
 	}
 
 	// a fresh set of ClientEnds.
