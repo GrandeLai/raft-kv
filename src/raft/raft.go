@@ -32,6 +32,9 @@ const (
 	// 定义选举超时的上下界
 	electionTimeoutMin time.Duration = 250 * time.Millisecond
 	electionTimeoutMax time.Duration = 400 * time.Millisecond
+
+	//定义心跳发送间隔
+	replicationInterval = 200 * time.Millisecond
 )
 
 func (rf *Raft) resetElectionTimerLocked() {
@@ -100,7 +103,7 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DLog, "%s->Follower ,for T%s->T%s", rf.role, rf.currentTerm, term)
+	LOG(rf.me, rf.currentTerm, DLog, "%s->Follower ,for T%v->T%v", rf.role, rf.currentTerm, term)
 	rf.role = Follower
 	if term > rf.currentTerm {
 		rf.votedFor = -1
@@ -132,11 +135,9 @@ func (rf *Raft) becomeLeaderLocked() {
 
 // return currentTerm and whether this server believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (PartA).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.role == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -187,14 +188,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 // example RequestVote RPC arguments structure.
-// field names must start with capital letters!
 type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
-// field names must start with capital letters!
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -234,30 +233,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
+// fills in *reply with RPC reply, so caller should pass &reply.
 // the types of the args and reply passed to Call() must be
 // the same as the types of the arguments declared in the
 // handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -309,8 +288,94 @@ func (rf *Raft) contextLostLocked(role Role, term int) bool {
 	return !(rf.currentTerm == term && rf.role == role)
 }
 
-func (rf *Raft) replicationTicker(term int) {
+//心跳发送rpc的参数
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
 
+//心跳发送rpc的返回参数
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//对齐term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,higher term, T%d < T%d", args.LeaderId, args.Term, rf.currentTerm)
+		return
+	}
+
+	rf.becomeFollowerLocked(args.Term)
+
+	//重置时钟
+	rf.resetElectionTimerLocked()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) startReplication(term int) bool {
+
+	replicateToPeer := func(peer int, args *AppendEntriesArgs) {
+		reply := &AppendEntriesReply{}
+		ok := rf.sendAppendEntries(peer, args, reply)
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		//处理rpc的返回值
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DLog, "->S%d, Lost or Crashed", peer)
+			return
+		}
+		//对齐term
+		if reply.Term > rf.currentTerm {
+			//及时变成follower
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+	}
+
+	//currentTerm可能被并发修改，需要加锁
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//确保是否依然是当前term的leader
+	if !rf.contextLostLocked(Leader, term) {
+		LOG(rf.me, rf.currentTerm, DLog, "Lost leader[%d] to %s[T%d]", term, rf.role, rf.currentTerm)
+		return false
+	}
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			continue
+		}
+
+		//发送请求
+		args := &AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		go replicateToPeer(peer, args)
+	}
+	return true
+}
+
+//和选举逻辑不同，生命周期只有一个term
+func (rf *Raft) replicationTicker(term int) {
+	for !rf.killed() {
+		if ok := rf.startReplication(term); !ok {
+			//不是本term的leader，退出循环
+			break
+		}
+		time.Sleep(replicationInterval)
+	}
 }
 
 func (rf *Raft) startElection(term int) {
@@ -360,7 +425,7 @@ func (rf *Raft) startElection(term int) {
 	}
 
 	for peer := 0; peer < len(rf.peers); peer++ {
-		if peer != rf.me {
+		if peer == rf.me {
 			votes++
 			continue
 		}
