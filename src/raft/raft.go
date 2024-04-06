@@ -18,8 +18,6 @@ package raft
 //
 
 import (
-	//	"bytes"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,16 +34,6 @@ const (
 	//定义心跳发送间隔
 	replicationInterval = 200 * time.Millisecond
 )
-
-func (rf *Raft) resetElectionTimerLocked() {
-	rf.electionStart = time.Now()
-	randRange := int64(electionTimeoutMax - electionTimeoutMin)
-	rf.electionTimeout = electionTimeoutMin + time.Duration(rand.Int63()%randRange)
-}
-
-func (rf *Raft) isElectionTimeoutLocked() bool {
-	return time.Since(rf.electionStart) > rf.electionTimeout
-}
 
 // Role 每个peer的角色
 type Role string
@@ -89,9 +77,16 @@ type Raft struct {
 	// Your data here (PartA, PartB, PartC).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role            Role
-	currentTerm     int //当前任期
-	votedFor        int //投票给谁，-1表示没有投票给任何人
+	role        Role
+	currentTerm int //当前任期
+	votedFor    int //投票给谁，-1表示没有投票给任何人
+
+	//每个peer存在本地的日志
+	log []LogEntry
+	//只在leader中使用，相当于每个peer的视图
+	nextIndex  []int
+	matchIndex []int
+
 	electionStart   time.Time
 	electionTimeout time.Duration //随机的
 }
@@ -131,6 +126,10 @@ func (rf *Raft) becomeLeaderLocked() {
 	}
 	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
+	for peer := 0; peer < len(rf.peers); peer++ {
+		rf.nextIndex[peer] = len(rf.log)
+		rf.matchIndex[peer] = 0
+	}
 }
 
 // return currentTerm and whether this server believes it is the leader.
@@ -187,61 +186,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
-type RequestVoteArgs struct {
-	Term        int
-	CandidateId int
-}
-
-// example RequestVote RPC reply structure.
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-// RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	//对齐term
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject vote, higher term, T%d>T%d", args.CandidateId, rf.currentTerm, args.Term)
-		return
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term)
-	}
-
-	//检查本轮是否已投票
-	if rf.votedFor != -1 {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject, Already voted S%d", args.CandidateId, rf.votedFor)
-		reply.VoteGranted = false
-		return
-	}
-
-	//TODO:检测日志是否比我的更 新
-
-	reply.VoteGranted = true
-	rf.votedFor = args.CandidateId
-	rf.resetElectionTimerLocked()
-	LOG(rf.me, rf.currentTerm, DVote, "-> S%d", args.CandidateId)
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -288,174 +232,6 @@ func (rf *Raft) contextLostLocked(role Role, term int) bool {
 	return !(rf.currentTerm == term && rf.role == role)
 }
 
-//心跳发送rpc的参数
-type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-}
-
-//心跳发送rpc的返回参数
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	//对齐term
-	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,higher term, T%d < T%d", args.LeaderId, args.Term, rf.currentTerm)
-		return
-	}
-
-	rf.becomeFollowerLocked(args.Term)
-
-	//重置时钟
-	rf.resetElectionTimerLocked()
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-func (rf *Raft) startReplication(term int) bool {
-
-	replicateToPeer := func(peer int, args *AppendEntriesArgs) {
-		reply := &AppendEntriesReply{}
-		ok := rf.sendAppendEntries(peer, args, reply)
-
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
-		//处理rpc的返回值
-		if !ok {
-			LOG(rf.me, rf.currentTerm, DLog, "->S%d, Lost or Crashed", peer)
-			return
-		}
-		//对齐term
-		if reply.Term > rf.currentTerm {
-			//及时变成follower
-			rf.becomeFollowerLocked(reply.Term)
-			return
-		}
-	}
-
-	//currentTerm可能被并发修改，需要加锁
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	//确保是否依然是当前term的leader
-	if !rf.contextLostLocked(Leader, term) {
-		LOG(rf.me, rf.currentTerm, DLog, "Lost leader[%d] to %s[T%d]", term, rf.role, rf.currentTerm)
-		return false
-	}
-	for peer := 0; peer < len(rf.peers); peer++ {
-		if peer == rf.me {
-			continue
-		}
-
-		//发送请求
-		args := &AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-		}
-		go replicateToPeer(peer, args)
-	}
-	return true
-}
-
-//和选举逻辑不同，生命周期只有一个term
-func (rf *Raft) replicationTicker(term int) {
-	for !rf.killed() {
-		if ok := rf.startReplication(term); !ok {
-			//不是本term的leader，退出循环
-			break
-		}
-		time.Sleep(replicationInterval)
-	}
-}
-
-func (rf *Raft) startElection(term int) {
-	//发起选举只对当前term有效
-	votes := 0
-	//线程安全无需上锁，rpc方法也不能上锁
-	askVoteFromPeer := func(peer int, args *RequestVoteArgs) {
-		reply := &RequestVoteReply{}
-		ok := rf.sendRequestVote(peer, args, reply)
-
-		//处理resp
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
-		if !ok {
-			LOG(rf.me, rf.currentTerm, DError, "Ask vote from S%d, RPC failed", peer)
-			return
-		}
-
-		//对齐term
-		if reply.Term > rf.currentTerm {
-			//如果对方term比自己大，自己变为follower
-			rf.becomeFollowerLocked(reply.Term)
-			return
-		}
-
-		if rf.contextLostLocked(Candidate, term) {
-			LOG(rf.me, rf.currentTerm, DError, "Context lost,ignore RequestVoteReply for S%d", peer)
-			return
-		}
-
-		if reply.VoteGranted {
-			votes++
-			if votes > len(rf.peers)/2 {
-				rf.becomeLeaderLocked()
-				go rf.replicationTicker(term)
-			}
-		}
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.contextLostLocked(Candidate, term) {
-		LOG(rf.me, rf.currentTerm, DError, "Lost context to %s,ignore RequestVote", rf.role)
-		return
-	}
-
-	for peer := 0; peer < len(rf.peers); peer++ {
-		if peer == rf.me {
-			votes++
-			continue
-		}
-
-		args := &RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
-		}
-
-		go askVoteFromPeer(peer, args)
-	}
-}
-
-// 选举 Loop
-func (rf *Raft) electionTicker() {
-	for rf.killed() == false {
-
-		rf.mu.Lock()
-		if rf.role != Leader && rf.isElectionTimeoutLocked() {
-			rf.becomeCandidateLocked()
-			go rf.startElection(rf.currentTerm)
-		}
-		rf.mu.Unlock()
-
-		// pause for a random amount of time between 50 and 350 milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -478,6 +254,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionStart = time.Now()
 	rf.electionTimeout = 300 * time.Millisecond
+	//log初始化,类似于一个虚拟头结点
+	rf.log = append(rf.log, LogEntry{})
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
