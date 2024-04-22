@@ -15,13 +15,29 @@ func (rf *Raft) isElectionTimeoutLocked() bool {
 	return time.Since(rf.electionStart) > rf.electionTimeout
 }
 
-//选举的RPC请求参数.
+// 检测自己的最后一条日志是否比候选者的新
+func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
+
+	l := len(rf.log)
+	//make的时候已经append了一个dummy log，不需要判断l是否大于1了
+	lastTerm, lastIndex := rf.log[l-1].Term, l-1
+	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
+	if lastTerm != candidateTerm {
+		return lastTerm > candidateTerm
+	}
+	return lastIndex > candidateIndex
+}
+
+// 选举的RPC请求参数.
 type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
-//选举的RPC响应
+// 选举的RPC响应
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -50,12 +66,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	//TODO:检测日志是否比我的更 新
+	//检测日志是否比我的更新
+	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject Vote, S%d's log less up-to-date", args.CandidateId)
+		return
+	}
 
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
 	rf.resetElectionTimerLocked()
-	LOG(rf.me, rf.currentTerm, DVote, "-> S%d", args.CandidateId)
+	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted", args.CandidateId)
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -109,6 +129,7 @@ func (rf *Raft) startElection(term int) {
 		return
 	}
 
+	l := len(rf.log)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
@@ -116,8 +137,10 @@ func (rf *Raft) startElection(term int) {
 		}
 
 		args := &RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: l - 1,
+			LastLogTerm:  rf.log[l-1].Term,
 		}
 
 		go askVoteFromPeer(peer, args)

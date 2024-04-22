@@ -1,15 +1,18 @@
 package raft
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
-//日志持久化的结构体entry
+// 日志持久化的结构体entry
 type LogEntry struct {
 	Term         int
 	CommandValid bool //当前command是否需要apply
 	Command      interface{}
 }
 
-//心跳发送rpc的参数
+// 心跳发送rpc的参数
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
@@ -18,9 +21,12 @@ type AppendEntriesArgs struct {
 	PreLogIndex int
 	PreLogTerm  int
 	Entries     []LogEntry
+
+	//更新follower的commitIndex
+	LeaderCommit int
 }
 
-//心跳发送rpc的返回参数
+// 心跳发送rpc的返回参数
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -43,7 +49,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.becomeFollowerLocked(args.Term)
 
 	//preLog如果不匹配直接返回
-	if args.PreLogIndex > len(rf.log) {
+	if args.PreLogIndex >= len(rf.log) {
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,Follower log to short,Len: %d < Pre:%d", args.LeaderId, len(rf.log), args.PreLogIndex)
 		return
 	}
@@ -55,7 +61,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = append(rf.log[:args.PreLogIndex+1], args.Entries...)
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept log : (%d,%d]", args.PreLogIndex, args.PreLogIndex+len(args.Entries))
-	return
+
+	if args.LeaderCommit > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+		rf.applyCond.Signal()
+	}
 
 	//重置时钟
 	rf.resetElectionTimerLocked()
@@ -64,6 +75,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) getMajorityMatchedLocked() int {
+	//对matchIndex排序
+	tmpIndexes := make([]int, len(rf.peers))
+	copy(tmpIndexes, rf.matchIndex)
+	sort.Ints(tmpIndexes)
+
+	//找到中位数
+	majorityIdx := (len(rf.peers) - 1) / 2
+	LOG(rf.me, rf.currentTerm, DDebug, "Match index after sort: %v, majority[%d]=%d", tmpIndexes, majorityIdx, tmpIndexes[majorityIdx])
+	return tmpIndexes[majorityIdx]
 }
 
 func (rf *Raft) startReplication(term int) bool {
@@ -87,6 +110,12 @@ func (rf *Raft) startReplication(term int) bool {
 			return
 		}
 
+		// Context 检查
+		if rf.contextLostLocked(Leader, term) {
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context Lost, T%d:Leader->T%d:%s", peer, term, rf.currentTerm, rf.role)
+			return
+		}
+
 		//处理请求
 		if !reply.Success {
 			//回退一个term
@@ -95,13 +124,21 @@ func (rf *Raft) startReplication(term int) bool {
 				index--
 			}
 			rf.nextIndex[peer] = index + 1
-			LOG(rf.me, rf.currentTerm, DLog, "Not match with S%d in %d,try the next %d", peer, args.PreLogIndex, rf.nextIndex[peer])
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at %d, try next=%d", peer, args.PreLogIndex, rf.nextIndex[peer])
 			return
 		}
 
 		//更新 match和next index
 		rf.matchIndex[peer] = args.PreLogIndex + len(args.Entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
+		majorityMatched := rf.getMajorityMatchedLocked()
+
+		if majorityMatched > rf.commitIndex {
+			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
+			rf.commitIndex = majorityMatched
+			rf.applyCond.Signal()
+		}
 	}
 
 	//currentTerm可能被并发修改，需要加锁
@@ -109,7 +146,7 @@ func (rf *Raft) startReplication(term int) bool {
 	defer rf.mu.Unlock()
 
 	//确保是否依然是当前term的leader
-	if !rf.contextLostLocked(Leader, term) {
+	if rf.contextLostLocked(Leader, term) {
 		LOG(rf.me, rf.currentTerm, DLog, "Lost leader[%d] to %s[T%d]", term, rf.role, rf.currentTerm)
 		return false
 	}
@@ -124,18 +161,19 @@ func (rf *Raft) startReplication(term int) bool {
 		preIndex := rf.nextIndex[peer] - 1
 		preTerm := rf.log[preIndex].Term
 		args := &AppendEntriesArgs{
-			Term:        rf.currentTerm,
-			LeaderId:    rf.me,
-			PreLogIndex: preIndex,
-			PreLogTerm:  preTerm,
-			Entries:     rf.log[preIndex+1:],
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PreLogIndex:  preIndex,
+			PreLogTerm:   preTerm,
+			Entries:      rf.log[preIndex+1:],
+			LeaderCommit: rf.commitIndex,
 		}
 		go replicateToPeer(peer, args)
 	}
 	return true
 }
 
-//和选举逻辑不同，生命周期只有一个term
+// 和选举逻辑不同，生命周期只有一个term
 func (rf *Raft) replicationTicker(term int) {
 	for !rf.killed() {
 		if ok := rf.startReplication(term); !ok {
