@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,7 +87,7 @@ type Raft struct {
 	votedFor    int //投票给谁，-1表示没有投票给任何人
 
 	//每个peer存在本地的日志
-	log []LogEntry
+	log *RaftLog
 	//只在leader中使用，相当于每个peer的视图
 	nextIndex  []int
 	matchIndex []int
@@ -146,36 +145,9 @@ func (rf *Raft) becomeLeaderLocked() {
 	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
 	for peer := 0; peer < len(rf.peers); peer++ {
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 		rf.matchIndex[peer] = 0
 	}
-}
-
-//返回第一条日志的index
-func (rf *Raft) firstLog(term int) int {
-	for index, entry := range rf.log {
-		if entry.Term == term {
-			return index
-		} else if entry.Term > term {
-			break
-		}
-	}
-	return InvalidIndex
-}
-
-func (rf *Raft) logString() string {
-	var terms string
-	preTerm := rf.log[0].Term
-	preStart := 0
-	for i := 0; i < len(rf.log); i++ {
-		if rf.log[i].Term != preTerm {
-			terms += fmt.Sprintf(" Log:[%d,%d]T:%d", preStart, i-1, rf.log[i].Term)
-			preTerm = rf.log[i].Term
-			preStart = i
-		}
-	}
-	terms += fmt.Sprintf(" Log:[%d,%d]T:%d", preStart, len(rf.log)-1, preTerm)
-	return terms
 }
 
 // return currentTerm and whether this server believes it is the leader.
@@ -191,7 +163,11 @@ func (rf *Raft) GetState() (int, bool) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (PartD).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.log.doSnapshot(index, snapshot)
+	rf.persistLocked()
 }
 
 // the first return value is the index that the command will appear at
@@ -206,16 +182,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != Leader {
 		return 0, 0, false
 	}
-	rf.log = append(rf.log, LogEntry{
+	rf.log.append(LogEntry{
 		CommandValid: true,
 		Command:      command,
 		Term:         rf.currentTerm,
 	})
 	//必须进行日志持久化
 	rf.persistLocked()
-	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", rf.log.size()-1, rf.currentTerm)
 
-	return len(rf.log) - 1, rf.currentTerm, true
+	return rf.log.size() - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -265,9 +241,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionStart = time.Now()
 	rf.electionTimeout = 300 * time.Millisecond
 	//log初始化,类似于一个虚拟头结点
-	rf.log = append(rf.log, LogEntry{
-		Term: InvalidTerm,
-	})
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 

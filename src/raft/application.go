@@ -8,7 +8,7 @@ func (rf *Raft) applyTicker() {
 		//收集所有需要apply的entries
 		entries := make([]LogEntry, 0)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			entries = append(entries, rf.log[i])
+			entries = append(entries, rf.log.at(i))
 		}
 		rf.mu.Unlock()
 

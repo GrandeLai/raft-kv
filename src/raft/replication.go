@@ -71,29 +71,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.resetElectionTimerLocked()
 		if !reply.Success {
 			LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower Conflict:[%d]T:%d", args.LeaderId, reply.ConflictIndex, reply.ConflictTerm)
-			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower Log:%v", args.LeaderId, rf.logString())
+			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower Log:%v", args.LeaderId, rf.log.String())
 
 		}
 	}()
 
 	//preLog如果不匹配直接返回
-	if args.PreLogIndex >= len(rf.log) {
+	if args.PreLogIndex >= rf.log.size() {
 		//如果follower的日志过短
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = InvalidTerm
 
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,Follower log to short,Len: %d < Pre:%d", args.LeaderId, len(rf.log), args.PreLogIndex)
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,Follower log to short,Len: %d < Pre:%d", args.LeaderId, rf.log.size(), args.PreLogIndex)
 		return
 	}
-	if rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+	if rf.log.at(args.PreLogIndex).Term != args.PreLogTerm {
 		//日志没有过短但是term就是不匹配直接记上
-		reply.ConflictTerm = rf.log[args.PreLogIndex].Term
-		reply.ConflictIndex = rf.firstLog(reply.ConflictTerm) //拿到当前term的第一天日志
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,Pre Log not match, [%d]: T%d !=T%d", args.LeaderId, rf.log[args.PreLogIndex].Term, args.PreLogTerm)
+		reply.ConflictTerm = rf.log.at(args.PreLogIndex).Term
+		reply.ConflictIndex = rf.log.firstFor(reply.ConflictTerm) //拿到当前term的第一天日志
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, reject log,Pre Log not match, [%d]: T%d !=T%d", args.LeaderId, rf.log.at(args.PreLogIndex).Term, args.PreLogTerm)
 		return
 	}
 
-	rf.log = append(rf.log[:args.PreLogIndex+1], args.Entries...)
+	rf.log.appendFrom(args.PreLogIndex, args.Entries)
 	//必须进行日志持久化
 	rf.persistLocked()
 	reply.Success = true
@@ -158,7 +158,7 @@ func (rf *Raft) startReplication(term int) bool {
 			if reply.ConflictTerm == InvalidTerm {
 				rf.nextIndex[peer] = reply.ConflictIndex
 			} else {
-				firstIndex := rf.firstLog(reply.ConflictTerm)
+				firstIndex := rf.log.firstFor(reply.ConflictTerm)
 				if firstIndex != InvalidTerm {
 					//已leader的index为准
 					rf.nextIndex[peer] = firstIndex
@@ -172,8 +172,8 @@ func (rf *Raft) startReplication(term int) bool {
 				rf.nextIndex[peer] = preIndex
 			}
 			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Pre[%d]T:%d, try next Pre=[%d]T:%d",
-				peer, args.PreLogIndex, args.PreLogTerm, rf.nextIndex[peer]-1, rf.log[rf.nextIndex[peer]-1].Term)
-			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader Log=%v", peer, rf.logString())
+				peer, args.PreLogIndex, args.PreLogTerm, rf.nextIndex[peer]-1, rf.log.at(rf.nextIndex[peer]-1).Term)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader Log=%v", peer, rf.log.String())
 			return
 		}
 
@@ -183,7 +183,7 @@ func (rf *Raft) startReplication(term int) bool {
 
 		majorityMatched := rf.getMajorityMatchedLocked()
 
-		if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
+		if majorityMatched > rf.commitIndex && rf.log.at(majorityMatched).Term == rf.currentTerm {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
 			rf.applyCond.Signal()
@@ -201,20 +201,20 @@ func (rf *Raft) startReplication(term int) bool {
 	}
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
-			rf.matchIndex[peer] = len(rf.log) - 1
-			rf.nextIndex[peer] = len(rf.log)
+			rf.matchIndex[peer] = rf.log.size() - 1
+			rf.nextIndex[peer] = rf.log.size()
 			continue
 		}
 
 		//发送请求
 		preIndex := rf.nextIndex[peer] - 1
-		preTerm := rf.log[preIndex].Term
+		preTerm := rf.log.at(preIndex).Term
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PreLogIndex:  preIndex,
 			PreLogTerm:   preTerm,
-			Entries:      rf.log[preIndex+1:],
+			Entries:      rf.log.tail(preIndex + 1),
 			LeaderCommit: rf.commitIndex,
 		}
 		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d,Append request Send,args:%v", peer, args.String())
